@@ -15,12 +15,14 @@ from ..._mlir.ir import (
     ArrayAttr,
     IndexType,
     StringAttr,
+    MemRefType,
 )
 from ..._mlir.dialects import (
     func as func_d,
     allo as allo_d,
     arith as arith_d,
     scf as scf_d,
+    memref as memref_d,
 )
 from ...utils import parse_kernel_name, construct_kernel_name
 from .utils import (
@@ -954,7 +956,7 @@ class ComputationGraph:
                             with self.insert_point:
                                 org_func = self.tag_to_func[ele_tag].clone()
                                 org_func.attributes["sym_name"] = StringAttr.get(
-                                    f"{org_func.attributes["sym_name"].value}-"
+                                    f"{org_func.attributes['sym_name'].value}-"
                                 )
                             for old, new in zip(
                                 org_func.arguments,
@@ -991,6 +993,50 @@ class ComputationGraph:
                                 return parent == target_func
                             parent = parent.parent
                         return False
+
+                    def bufferize_stream_across_regions(
+                        stream_put: allo_d.StreamPutOp,
+                        stream_get: allo_d.StreamGetOp,
+                    ):
+                        """
+                        Materialize an explicit local buffer when the producer and
+                        consumer live in different reconstructed regions.
+                        """
+                        put_value = stream_put.operands[-1]
+                        get_result = stream_get.result
+                        buffer_type = (
+                            get_result.type
+                            if isinstance(get_result.type, MemRefType)
+                            else MemRefType.get([], get_result.type)
+                        )
+                        buffer_op = memref_d.AllocOp(
+                            buffer_type,
+                            [],
+                            [],
+                            ip=InsertionPoint.at_block_begin(entry_block),
+                        )
+                        if isinstance(get_result.type, MemRefType):
+                            memref_d.CopyOp(
+                                put_value,
+                                buffer_op.result,
+                                ip=InsertionPoint(stream_put.operation),
+                            )
+                            get_result.replace_all_uses_with(buffer_op.result)
+                        else:
+                            memref_d.StoreOp(
+                                value=put_value,
+                                memref=buffer_op.result,
+                                indices=[],
+                                ip=InsertionPoint(stream_put.operation),
+                            )
+                            load_op = memref_d.LoadOp(
+                                memref=buffer_op.result,
+                                indices=[],
+                                ip=InsertionPoint(stream_get.operation),
+                            )
+                            get_result.replace_all_uses_with(load_op.result)
+                        stream_put.erase()
+                        stream_get.erase()
 
                     for bufferized_stream_info in node.buffered_stream.values():
                         # collect put/get, filter out the put/get not in the new kernel function
@@ -1051,8 +1097,9 @@ class ComputationGraph:
                                         stream_put.parent.erase()
                                         stream_get.erase()
                                         continue
-                                # TODO: support bufferize stream across regions
-                                raise RuntimeError("TODO")
+                                bufferize_stream_across_regions(
+                                    stream_put, stream_get
+                                )
         # Step4: Clean up unused functions
         for func in self.allo_module.body.operations:
             if isinstance(func, func_d.FuncOp) and "df.kernel" in func.attributes:
