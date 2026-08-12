@@ -40,7 +40,7 @@ def make_atb_top(rho):
         def load_b(local_B: Ty[K, N]):
             b = local_B
             with allo.meta_for(rho) as i:
-                pipeB[i].put(local_B)
+                pipeB[i].put(b)
 
         @df.kernel(mapping=[rho], args=[A])
         def compute(local_A: Ty[M, K] @ [S(0), R]):
