@@ -16,13 +16,15 @@ from ..._mlir.ir import (
     IndexType,
     StringAttr,
     MemRefType,
+    StridedLayoutAttr,
+    ShapedType,
 )
 from ..._mlir.dialects import (
     func as func_d,
     allo as allo_d,
     arith as arith_d,
-    scf as scf_d,
     memref as memref_d,
+    scf as scf_d,
 )
 from ...utils import parse_kernel_name, construct_kernel_name
 from .utils import (
@@ -1038,24 +1040,309 @@ class ComputationGraph:
                         stream_put.erase()
                         stream_get.erase()
 
+                    def collect_stream_accesses(target_func, target_arg, op_type):
+                        """
+                        Collect stream accesses in textual order by recursively walking the IR.
+                        """
+                        collected = []
+
+                        def walk(op):
+                            if getattr(op, "name", None) == "func.func":
+                                return
+                            if (
+                                isinstance(op, op_type)
+                                and len(op.operands) > 0
+                                and op.operands[0] == target_arg
+                            ):
+                                collected.append(op)
+                            for region in op.regions:
+                                for block in region.blocks:
+                                    for inner_op in block.operations:
+                                        walk(inner_op)
+
+                        for op in target_func.entry_block.operations:
+                            walk(op)
+                        return collected
+
+                    def get_enclosing_loop(op):
+                        parent = op.parent
+                        while parent is not None:
+                            if getattr(parent, "name", None) in {"scf.for", "affine.for"}:
+                                return parent
+                            if getattr(parent, "name", None) == "func.func":
+                                return None
+                            parent = parent.parent
+                        return None
+
+                    def get_loop_induction_variable(loop):
+                        if loop is None:
+                            return None
+                        loop_view = getattr(loop, "opview", None)
+                        if loop_view is not None and hasattr(
+                            loop_view, "induction_variable"
+                        ):
+                            return loop_view.induction_variable
+                        if hasattr(loop, "induction_variable"):
+                            return loop.induction_variable
+                        try:
+                            return loop.regions[0].blocks[0].arguments[0]
+                        except Exception:
+                            return None
+
+                    def get_constant_int(value):
+                        owner = getattr(value, "owner", None)
+                        if owner is None or getattr(owner, "name", None) != "arith.constant":
+                            return None
+                        if "value" not in owner.attributes:
+                            return None
+                        attr = owner.attributes["value"]
+                        if hasattr(attr, "value"):
+                            return int(attr.value)
+                        try:
+                            return int(str(attr))
+                        except ValueError:
+                            return None
+
+                    def get_loop_trip_count(loop):
+                        if loop is None:
+                            return None
+                        if getattr(loop, "name", None) == "scf.for":
+                            operands = list(loop.operands)
+                            if len(operands) < 3:
+                                return None
+                            lower = get_constant_int(operands[0])
+                            upper = get_constant_int(operands[1])
+                            step = get_constant_int(operands[2])
+                            if lower is None or upper is None:
+                                return None
+                            if step is None:
+                                step = 1
+                            if step <= 0:
+                                return None
+                            if upper <= lower:
+                                return 0
+                            return (upper - lower + step - 1) // step
+                        if getattr(loop, "name", None) == "affine.for":
+                            try:
+                                lower_map = loop.lowerBoundMap.value
+                                upper_map = loop.upperBoundMap.value
+                                if len(loop.lowerBoundOperands) != 0:
+                                    return None
+                                if len(loop.upperBoundOperands) != 0:
+                                    return None
+                                lower = int(str(lower_map.results[0]))
+                                upper = int(str(upper_map.results[0]))
+                                step = 1 if loop.step is None else int(loop.step)
+                                if step <= 0:
+                                    return None
+                                if upper <= lower:
+                                    return 0
+                                return (upper - lower + step - 1) // step
+                            except Exception:
+                                return None
+                        return None
+
+                    def bufferize_stream_accesses(
+                        stream_puts: list[allo_d.StreamPutOp],
+                        stream_gets: list[allo_d.StreamGetOp],
+                    ):
+                        """
+                        Bufferize a stream when loop-carried communication requires
+                        multiple local slots.
+                        """
+                        reference_type = (
+                            stream_gets[0].result.type
+                            if len(stream_gets) > 0
+                            else stream_puts[0].operands[-1].type
+                        )
+                        is_tensor = isinstance(reference_type, MemRefType)
+                        loop_trip_counts = [
+                            trip_count
+                            for trip_count in [
+                                get_loop_trip_count(get_enclosing_loop(op))
+                                for op in stream_puts + stream_gets
+                            ]
+                            if trip_count is not None
+                        ]
+                        slot_count_candidates = [
+                            len(stream_puts),
+                            len(stream_gets),
+                            *loop_trip_counts,
+                        ]
+                        slot_count = max(slot_count_candidates)
+                        if is_tensor:
+                            buffer_type = MemRefType.get(
+                                [slot_count] + list(reference_type.shape),
+                                reference_type.element_type,
+                            )
+                        else:
+                            buffer_type = MemRefType.get([slot_count], reference_type)
+
+                        buffer_op = memref_d.AllocOp(
+                            buffer_type,
+                            [],
+                            [],
+                            ip=InsertionPoint.at_block_begin(entry_block),
+                        )
+
+                        def get_tensor_slot_view_type(slot_value, is_dynamic):
+                            """
+                            Build the rank-reduced subview type for one tensor slot.
+
+                            The buffer is laid out as [slot, tensor_dims...], so the
+                            view keeps only the tensor dimensions and carries the
+                            row-major stride metadata explicitly.
+                            """
+                            result_shape = list(reference_type.shape)
+                            result_strides = []
+                            running_stride = 1
+                            for dim in reversed(result_shape):
+                                if dim < 0:
+                                    return reference_type
+                                result_strides.append(running_stride)
+                                running_stride *= dim
+                            result_strides.reverse()
+                            layout_offset = (
+                                ShapedType.get_dynamic_stride_or_offset()
+                                if is_dynamic
+                                else slot_value * running_stride
+                            )
+                            return MemRefType.get(
+                                result_shape,
+                                reference_type.element_type,
+                                layout=StridedLayoutAttr.get(
+                                    offset=layout_offset,
+                                    strides=result_strides,
+                                ),
+                            )
+
+                        def access_slot(op, ordinal):
+                            loop = get_enclosing_loop(op)
+                            if loop is not None:
+                                loop_iv = get_loop_induction_variable(loop)
+                                if loop_iv is not None:
+                                    return True, loop_iv
+                            return False, ordinal
+
+                        def materialize_put(stream_put: allo_d.StreamPutOp, ordinal: int):
+                            put_value = stream_put.operands[-1]
+                            is_dynamic, slot_value = access_slot(stream_put, ordinal)
+                            if is_tensor:
+                                slot_view_type = get_tensor_slot_view_type(
+                                    slot_value, is_dynamic
+                                )
+                                static_offsets = (
+                                    [ShapedType.get_dynamic_size()]
+                                    if is_dynamic
+                                    else [slot_value]
+                                ) + [0] * len(reference_type.shape)
+                                offsets = [slot_value] if is_dynamic else []
+                                slot_view = memref_d.SubViewOp(
+                                    source=buffer_op.result,
+                                    result=slot_view_type,
+                                    static_offsets=static_offsets,
+                                    static_sizes=[1] + list(reference_type.shape),
+                                    static_strides=[1]
+                                    * (len(reference_type.shape) + 1),
+                                    offsets=offsets,
+                                    sizes=[],
+                                    strides=[],
+                                    ip=InsertionPoint(stream_put.operation),
+                                )
+                                memref_d.CopyOp(
+                                    put_value,
+                                    slot_view.result,
+                                    ip=InsertionPoint(stream_put.operation),
+                                )
+                            else:
+                                if is_dynamic:
+                                    index_value = slot_value
+                                else:
+                                    index_value = arith_d.ConstantOp(
+                                        IndexType.get(),
+                                        slot_value,
+                                        ip=InsertionPoint(stream_put.operation),
+                                    ).result
+                                memref_d.StoreOp(
+                                    value=put_value,
+                                    memref=buffer_op.result,
+                                    indices=[index_value],
+                                    ip=InsertionPoint(stream_put.operation),
+                                )
+                            stream_put.erase()
+
+                        def materialize_get(stream_get: allo_d.StreamGetOp, ordinal: int):
+                            get_result = stream_get.result
+                            is_dynamic, slot_value = access_slot(stream_get, ordinal)
+                            if is_tensor:
+                                slot_view_type = get_tensor_slot_view_type(
+                                    slot_value, is_dynamic
+                                )
+                                static_offsets = (
+                                    [ShapedType.get_dynamic_size()]
+                                    if is_dynamic
+                                    else [slot_value]
+                                ) + [0] * len(reference_type.shape)
+                                offsets = [slot_value] if is_dynamic else []
+                                slot_view = memref_d.SubViewOp(
+                                    source=buffer_op.result,
+                                    result=slot_view_type,
+                                    static_offsets=static_offsets,
+                                    static_sizes=[1] + list(reference_type.shape),
+                                    static_strides=[1]
+                                    * (len(reference_type.shape) + 1),
+                                    offsets=offsets,
+                                    sizes=[],
+                                    strides=[],
+                                    ip=InsertionPoint(stream_get.operation),
+                                )
+                                get_result.replace_all_uses_with(slot_view.result)
+                            else:
+                                if is_dynamic:
+                                    index_value = slot_value
+                                else:
+                                    index_value = arith_d.ConstantOp(
+                                        IndexType.get(),
+                                        slot_value,
+                                        ip=InsertionPoint(stream_get.operation),
+                                    ).result
+                                load_op = memref_d.LoadOp(
+                                    memref=buffer_op.result,
+                                    indices=[index_value],
+                                    ip=InsertionPoint(stream_get.operation),
+                                )
+                                get_result.replace_all_uses_with(load_op.result)
+                            stream_get.erase()
+
+                        for i, stream_put in enumerate(stream_puts):
+                            materialize_put(stream_put, i)
+                        for i, stream_get in enumerate(stream_gets):
+                            materialize_get(stream_get, i)
+
                     for bufferized_stream_info in node.buffered_stream.values():
-                        # collect put/get, filter out the put/get not in the new kernel function
-                        stream_puts = [
-                            use.owner
-                            for use in new_function.arguments[
+                        stream_puts = collect_stream_accesses(
+                            new_function,
+                            new_function.arguments[
                                 bufferized_stream_info.src_arg_idx
-                            ].uses
-                            if isinstance(use.owner, allo_d.StreamPutOp)
-                            and is_op_in_func(use.owner, new_function)
-                        ]
-                        stream_gets = [
-                            use.owner
-                            for use in new_function.arguments[
+                            ],
+                            allo_d.StreamPutOp,
+                        )
+                        stream_gets = collect_stream_accesses(
+                            new_function,
+                            new_function.arguments[
                                 bufferized_stream_info.dst_arg_idx
-                            ].uses
-                            if isinstance(use.owner, allo_d.StreamGetOp)
-                            and is_op_in_func(use.owner, new_function)
-                        ]
+                            ],
+                            allo_d.StreamGetOp,
+                        )
+                        if len(stream_puts) == 0 or len(stream_gets) == 0:
+                            continue
+                        has_loop = any(
+                            get_enclosing_loop(op) is not None
+                            for op in stream_puts + stream_gets
+                        )
+                        if has_loop:
+                            bufferize_stream_accesses(stream_puts, stream_gets)
+                            continue
                         assert len(stream_puts) == len(stream_gets)
                         for i in range(len(stream_puts)):
                             stream_put: allo_d.StreamPutOp = stream_puts[i]
@@ -1097,6 +1384,7 @@ class ComputationGraph:
                                         stream_put.parent.erase()
                                         stream_get.erase()
                                         continue
+                                # TODO: support bufferize stream across regions
                                 bufferize_stream_across_regions(
                                     stream_put, stream_get
                                 )

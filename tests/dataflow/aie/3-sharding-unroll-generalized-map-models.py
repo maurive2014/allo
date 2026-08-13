@@ -104,7 +104,7 @@ def run_atb(rho):
         mod = df.build(
             top,
             target="aie",
-            project="rho-model.prj",
+            project="rho-model-loopv3.prj",
             mapping_primitives=mapping_primitives,
         )
         mod(B, A, C)
