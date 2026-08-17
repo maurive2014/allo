@@ -1368,10 +1368,159 @@ class ComputationGraph:
                                 get_result.replace_all_uses_with(load_op.result)
                             stream_get.erase()
 
+                        def try_coalesce_static_tensor_gets():
+                            """Copy a complete contiguous slot buffer at once.
+
+                            A looped producer followed by static, contiguous tensor
+                            consumers otherwise becomes one copy per slot. For larger
+                            bundle factors, those repeated copies can overflow AIE
+                            program memory even though the data is contiguous.
+                            """
+                            if (
+                                not is_tensor
+                                or len(reference_type.shape) == 0
+                                or len(stream_puts) != 1
+                                or get_enclosing_loop(stream_puts[0]) is None
+                                or len(stream_gets) != slot_count
+                                or any(
+                                    get_enclosing_loop(stream_get) is not None
+                                    for stream_get in stream_gets
+                                )
+                            ):
+                                return False
+
+                            def find_copy_users(value):
+                                copy_users = []
+
+                                def walk(op):
+                                    if (
+                                        getattr(op, "name", None) == "memref.copy"
+                                        and len(op.operands) >= 2
+                                        and op.operands[0] == value
+                                    ):
+                                        copy_users.append(op)
+                                    for region in op.regions:
+                                        for block in region.blocks:
+                                            for inner_op in block.operations:
+                                                walk(inner_op)
+
+                                for op in new_function.entry_block.operations:
+                                    walk(op)
+                                return copy_users
+
+                            tensor_shape = list(reference_type.shape)
+                            destination_buffer = None
+                            first_copy_parent = None
+                            for ordinal, stream_get in enumerate(stream_gets):
+                                copy_users = find_copy_users(stream_get.result)
+                                if len(copy_users) != 1:
+                                    return False
+                                copy_op = copy_users[0]
+
+                                # Some MLIR Python bindings report the same use more
+                                # than once. Validate the users by operation instead
+                                # of requiring a single entry in Value.uses.
+                                for use in stream_get.result.uses:
+                                    user = use.owner
+                                    if (
+                                        getattr(user, "name", None) != "memref.copy"
+                                        or user.operands[0] != stream_get.result
+                                    ):
+                                        return False
+
+                                destination_subview = copy_op.operands[1].owner
+                                if (
+                                    getattr(destination_subview, "name", None)
+                                    != "memref.subview"
+                                    or len(destination_subview.operands) != 1
+                                ):
+                                    return False
+                                current_destination = destination_subview.operands[0]
+                                if destination_buffer is None:
+                                    destination_buffer = current_destination
+                                    first_copy_parent = copy_op.parent
+                                elif (
+                                    current_destination != destination_buffer
+                                    or copy_op.parent != first_copy_parent
+                                ):
+                                    return False
+
+                                try:
+                                    static_offsets = [
+                                        int(value)
+                                        for value in destination_subview.attributes[
+                                            "static_offsets"
+                                        ]
+                                    ]
+                                    static_sizes = [
+                                        int(value)
+                                        for value in destination_subview.attributes[
+                                            "static_sizes"
+                                        ]
+                                    ]
+                                    static_strides = [
+                                        int(value)
+                                        for value in destination_subview.attributes[
+                                            "static_strides"
+                                        ]
+                                    ]
+                                except (KeyError, TypeError, ValueError):
+                                    return False
+                                expected_offsets = [
+                                    ordinal * tensor_shape[0]
+                                ] + [0] * (len(tensor_shape) - 1)
+                                if (
+                                    static_offsets != expected_offsets
+                                    or static_sizes != tensor_shape
+                                    or static_strides != [1] * len(tensor_shape)
+                                ):
+                                    return False
+
+                            if destination_buffer is None:
+                                return False
+                            destination_type = MemRefType(destination_buffer.type)
+                            expected_destination_shape = [
+                                slot_count * tensor_shape[0]
+                            ] + tensor_shape[1:]
+                            if (
+                                list(destination_type.shape)
+                                != expected_destination_shape
+                                or destination_type.element_type
+                                != reference_type.element_type
+                            ):
+                                return False
+
+                            reassociation = [[0, 1]] + [
+                                [dimension]
+                                for dimension in range(2, len(buffer_type.shape))
+                            ]
+                            first_stream_get = stream_gets[0]
+                            collapsed = memref_d.CollapseShapeOp(
+                                destination_buffer.type,
+                                buffer_op.result,
+                                reassociation,
+                                ip=InsertionPoint(first_stream_get.operation),
+                            )
+                            memref_d.CopyOp(
+                                collapsed.result,
+                                destination_buffer,
+                                ip=InsertionPoint(first_stream_get.operation),
+                            )
+                            for stream_get in stream_gets:
+                                while True:
+                                    remaining_uses = list(stream_get.result.uses)
+                                    if len(remaining_uses) == 0:
+                                        break
+                                    remaining_uses[0].owner.erase()
+                                stream_get.erase()
+                            return True
+
+                        coalesced_gets = try_coalesce_static_tensor_gets()
                         for i, stream_put in enumerate(stream_puts):
                             materialize_put(stream_put, i)
-                        for i, stream_get in enumerate(stream_gets):
-                            materialize_get(stream_get, i)
+                        if not coalesced_gets:
+                            for i, stream_get in enumerate(stream_gets):
+                                materialize_get(stream_get, i)
 
                     for bufferized_stream_info in node.buffered_stream.values():
                         stream_puts = collect_stream_accesses(
