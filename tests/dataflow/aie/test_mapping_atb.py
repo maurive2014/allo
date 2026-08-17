@@ -6,7 +6,7 @@ import pytest
 import numpy as np
 import allo
 import allo.dataflow as df
-from allo.backend.aie import is_available
+from allo.backend.aie import AIE_MLIRModule, is_available
 from allo.ir.types import int16, Stream
 from allo.memory import Layout
 
@@ -113,6 +113,81 @@ def test_atb(rho):
         print(f"rho={rho} PASSED!")
     else:
         print("MLIR_AIE_INSTALL_DIR unset. Skipping AIE backend test.")
+
+
+@pytest.mark.skipif(not is_available(), reason="MLIR-AIE is unavailable")
+def test_bundle_chain_bufferizes_all_stream_aliases(tmp_path, monkeypatch):
+    """Bundled stream aliases must all become accesses to the same local buffer."""
+    Ty = int16
+    rho = 4
+    M, N, K = 64, 16, 16
+    Ma = M // rho
+
+    @df.region()
+    def top(A: Ty[M, K], B: Ty[K, N], C: Ty[M, N]):
+        pipeB: Stream[Ty[K, N], 1][rho]
+        pipeC: Stream[Ty[Ma, N], 1][rho]
+
+        @df.kernel(mapping=[1], args=[B])
+        def loadB(local_B: Ty[K, N]):
+            with allo.meta_for(rho) as i:
+                pipeB[i].put(local_B)
+
+        @df.kernel(mapping=[rho], args=[A])
+        def compute(local_A: Ty[M, K] @ [S(0), R]):
+            pk = df.get_pid()
+            pipeC[pk].put(allo.matmul(local_A, pipeB[pk].get()))
+
+        @df.kernel(mapping=[1], args=[C])
+        def store(local_C: Ty[M, N]):
+            with allo.meta_for(rho) as i:
+                local_C[i * Ma : (i + 1) * Ma, :] = pipeC[i].get()
+
+    monkeypatch.setenv("FORCE_UNROLL_INDEX", "1")
+    monkeypatch.setattr(
+        AIE_MLIRModule,
+        "post_codegen_build",
+        lambda _self, _external_cc_list: None,
+    )
+    project = tmp_path / "bundle-chain-bufferization.prj"
+    core_name = "compute_0x4-store_0"
+    mod = df.build(
+        top,
+        target="aie",
+        project=str(project),
+        mapping_primitives=[
+            ("bundle", [f"compute_{i}" for i in range(rho)]),
+            ("chain", ["compute_0x4", "store_0"]),
+        ],
+    )
+
+    original_mlir = (project / "original.mlir").read_text(encoding="utf-8")
+    core_mlir = original_mlir.split(f'func.func @"{core_name}"', 1)[1]
+    core_mlir = core_mlir.split("func.func @top", 1)[0]
+    assert core_mlir.count("allo.stream_get") == 1  # external pipeB
+    assert "allo.stream_put" not in core_mlir
+    assert "memref<4x16x16xi16>" in core_mlir
+    assert "memref.subview %alloc[%" in core_mlir
+    for slot in range(rho):
+        assert f"[{slot}, 0, 0] [1, 16, 16]" in core_mlir
+
+    optimized_mlir = (project / "original_opt.mlir").read_text(encoding="utf-8")
+    assert "memref.collapse_shape" in optimized_mlir
+    assert (
+        "memref<4x16x16xi16> into memref<64x16xi16>" in optimized_mlir
+    )
+
+    remaining_stream_names = set()
+    for arg_info in mod.core_func_args[core_name].values():
+        arguments = arg_info[0] if isinstance(arg_info[0], list) else [arg_info[0]]
+        remaining_stream_names.update(
+            argument.stream.name
+            for argument in arguments
+            if argument.stream is not None
+        )
+    assert not any(name.startswith("pipeC") for name in remaining_stream_names)
+    assert mod.aie_module is not None
+    assert "aie.core" in str(mod.aie_module)
 
 
 if __name__ == "__main__":

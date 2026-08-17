@@ -104,7 +104,7 @@ def run_atb(rho):
         mod = df.build(
             top,
             target="aie",
-            project="rho-model-loopv3.prj",
+            project="rho-model-loopv2.prj",
             mapping_primitives=mapping_primitives,
         )
         mod(B, A, C)
@@ -115,8 +115,8 @@ def run_atb(rho):
         print("MLIR_AIE_INSTALL_DIR unset. Skipping AIE backend test.")
 
 
-run_atb(2) 
+run_atb(4) 
 # for rho 1 model 1,2,3,4 work 
-# for rho 2 model 1 work
+# for rho 2 model 1,2 work
 # for rho 4 model 1 work
-# rho = 8 doesn't work in any model.
+# rho = 8 doesn't work in any model

@@ -341,16 +341,14 @@ class LiveDTensorTileGroup:
 # ------------------------------------------------------------
 @dataclass
 class BufferedStream:
-    """
-    record information of stream that needs to be converted into
-    a local buffer after applying the virtual mapping primitive.
+    """Record ordered function-argument endpoints of a stream made local by mapping.
 
-        - src_arg_idx: Index of the source value in the function's argument list.
-        - dst_arg_idx: Index of the destination value in the function's argument list.
+    Bundling aliases several physical streams to one canonical stream name, so
+    either endpoint can be represented by multiple function arguments.
     """
 
-    src_arg_idx: int
-    dst_arg_idx: int
+    src_arg_indices: tuple[int, ...]
+    dst_arg_indices: tuple[int, ...]
 
 
 # pylint: disable=too-many-instance-attributes
@@ -524,8 +522,12 @@ class CollocatedNode(NodeBase):
         )
         self.buffered_stream.update(node_a.buffered_stream)
         for stream_info in node_b.buffered_stream.values():
-            stream_info.src_arg_idx += arg_idx_offset
-            stream_info.dst_arg_idx += arg_idx_offset
+            stream_info.src_arg_indices = tuple(
+                idx + arg_idx_offset for idx in stream_info.src_arg_indices
+            )
+            stream_info.dst_arg_indices = tuple(
+                idx + arg_idx_offset for idx in stream_info.dst_arg_indices
+            )
         self.buffered_stream.update(node_b.buffered_stream)
         self.meta_data.df_kernels.update(node_a.meta_data.df_kernels)
         self.meta_data.df_kernels.update(node_b.meta_data.df_kernels)
@@ -797,48 +799,61 @@ class ComputationGraph:
         ]
         kept_streams = []
         arg_idx_offset = len(node_a.meta_data.in_types)
+
+        def get_canonical_stream_names(arg_info):
+            arguments = (
+                [arg_info[0]] if isinstance(arg_info[0], Argument) else arg_info[0]
+            )
+            return {
+                argument.stream.name
+                for argument in arguments
+                if argument.stream is not None
+            }
+
+        def find_stream_arg_indices(params, stream_name, is_input):
+            indices = []
+            for idx, arg_info in params.items():
+                if arg_info[1] != is_input:
+                    continue
+                stream_names = get_canonical_stream_names(arg_info)
+                if stream_name not in stream_names:
+                    continue
+                if stream_names != {stream_name}:
+                    raise ValueError(
+                        "Cannot partially bufferize a function argument that "
+                        f"represents multiple streams: {sorted(stream_names)}"
+                    )
+                indices.append(idx)
+            return tuple(sorted(indices))
+
+        bufferized_stream_names = set()
         for stream in node_b.meta_data.input_streams:
             if stream.src == node_name_a:
-                idx_a, idx_b = -1, -1
-                for idx, arg_info in param_a.items():
-                    stream_names = set()
-                    if isinstance(arg_info[0], list):
-                        for stream_arg in arg_info[0]:
-                            stream_names.add(stream_arg.stream.name)
-                    assert (
-                        isinstance(arg_info[0], Argument) or len(stream_names) == 1
-                    ), "TODO: add support to handle producer-consumer chaining where stream is used in non-unrolled meta_for loops"
-                    arg_info_ = (
-                        arg_info[0]
-                        if isinstance(arg_info[0], Argument)
-                        else arg_info[0][0]
-                    )
-                    if arg_info_.stream is not None and arg_info_.stream == stream:
-                        idx_a = idx
-                        break
-                for idx, arg_info in param_b.items():
-                    stream_names = set()
-                    if isinstance(arg_info[0], list):
-                        for stream_arg in arg_info[0]:
-                            stream_names.add(stream_arg.stream.name)
-                    assert (
-                        isinstance(arg_info[0], Argument) or len(stream_names) == 1
-                    ), "TODO: add support to handle producer-consumer chaining where stream is used in non-unrolled meta_for loops"
-                    arg_info_ = (
-                        arg_info[0]
-                        if isinstance(arg_info[0], Argument)
-                        else arg_info[0][0]
-                    )
-                    if arg_info_.stream is not None and arg_info_.stream == stream:
-                        idx_b = idx
-                        break
-                assert idx_a >= 0 and idx_b >= 0
-                chained_node.buffered_stream[stream] = BufferedStream(
-                    idx_a, idx_b + arg_idx_offset
+                stream_name = stream.name
+                if stream_name in bufferized_stream_names:
+                    continue
+                src_arg_indices = find_stream_arg_indices(
+                    param_a, stream_name, is_input=False
                 )
-                param_a.pop(idx_a)
-                param_b.pop(idx_b)
-                self.edges.pop(stream.name)
+                dst_arg_indices = find_stream_arg_indices(
+                    param_b, stream_name, is_input=True
+                )
+                if len(src_arg_indices) == 0 or len(dst_arg_indices) == 0:
+                    raise ValueError(
+                        "Cannot resolve both endpoints of buffered stream "
+                        f"{stream_name}: sources={src_arg_indices}, "
+                        f"destinations={dst_arg_indices}"
+                    )
+                chained_node.buffered_stream[stream] = BufferedStream(
+                    src_arg_indices,
+                    tuple(idx + arg_idx_offset for idx in dst_arg_indices),
+                )
+                for idx in src_arg_indices:
+                    param_a.pop(idx)
+                for idx in dst_arg_indices:
+                    param_b.pop(idx)
+                self.edges.pop(stream_name)
+                bufferized_stream_names.add(stream_name)
             else:
                 kept_streams.append(stream)
         node_b.meta_data.input_streams = kept_streams
@@ -1040,10 +1055,11 @@ class ComputationGraph:
                         stream_put.erase()
                         stream_get.erase()
 
-                    def collect_stream_accesses(target_func, target_arg, op_type):
-                        """
-                        Collect stream accesses in textual order by recursively walking the IR.
-                        """
+                    def collect_stream_accesses(target_func, target_args, op_type):
+                        """Collect accesses across aliased args in textual order."""
+                        target_args = tuple(target_args)
+                        if len(target_args) == 0:
+                            raise ValueError("Expected at least one stream argument")
                         collected = []
 
                         def walk(op):
@@ -1052,7 +1068,10 @@ class ComputationGraph:
                             if (
                                 isinstance(op, op_type)
                                 and len(op.operands) > 0
-                                and op.operands[0] == target_arg
+                                and any(
+                                    op.operands[0] == target_arg
+                                    for target_arg in target_args
+                                )
                             ):
                                 collected.append(op)
                             for region in op.regions:
@@ -1067,7 +1086,10 @@ class ComputationGraph:
                     def get_enclosing_loop(op):
                         parent = op.parent
                         while parent is not None:
-                            if getattr(parent, "name", None) in {"scf.for", "affine.for"}:
+                            if getattr(parent, "name", None) in {
+                                "scf.for",
+                                "affine.for",
+                            }:
                                 return parent
                             if getattr(parent, "name", None) == "func.func":
                                 return None
@@ -1091,7 +1113,10 @@ class ComputationGraph:
 
                     def get_constant_int(value):
                         owner = getattr(value, "owner", None)
-                        if owner is None or getattr(owner, "name", None) != "arith.constant":
+                        if (
+                            owner is None
+                            or getattr(owner, "name", None) != "arith.constant"
+                        ):
                             return None
                         if "value" not in owner.attributes:
                             return None
@@ -1156,20 +1181,45 @@ class ComputationGraph:
                             else stream_puts[0].operands[-1].type
                         )
                         is_tensor = isinstance(reference_type, MemRefType)
-                        loop_trip_counts = [
-                            trip_count
-                            for trip_count in [
-                                get_loop_trip_count(get_enclosing_loop(op))
-                                for op in stream_puts + stream_gets
+
+                        def get_access_event_count(accesses, endpoint):
+                            looped_accesses = [
+                                op
+                                for op in accesses
+                                if get_enclosing_loop(op) is not None
                             ]
-                            if trip_count is not None
-                        ]
-                        slot_count_candidates = [
-                            len(stream_puts),
-                            len(stream_gets),
-                            *loop_trip_counts,
-                        ]
-                        slot_count = max(slot_count_candidates)
+                            if len(looped_accesses) == 0:
+                                return len(accesses)
+                            if len(accesses) != 1:
+                                raise ValueError(
+                                    "Loop-aware stream bufferization currently "
+                                    f"supports one looped access per {endpoint} "
+                                    f"endpoint, got {len(accesses)} accesses"
+                                )
+                            trip_count = get_loop_trip_count(
+                                get_enclosing_loop(looped_accesses[0])
+                            )
+                            if trip_count is None or trip_count <= 0:
+                                raise ValueError(
+                                    "Loop-aware stream bufferization requires a "
+                                    "positive static trip count for the "
+                                    f"{endpoint} endpoint"
+                                )
+                            return trip_count
+
+                        put_event_count = get_access_event_count(
+                            stream_puts, "producer"
+                        )
+                        get_event_count = get_access_event_count(
+                            stream_gets, "consumer"
+                        )
+                        if put_event_count != get_event_count:
+                            raise ValueError(
+                                "Buffered stream producer/consumer event "
+                                f"count mismatch: {put_event_count} puts vs "
+                                f"{get_event_count} gets"
+                            )
+                        slot_count = put_event_count
                         if is_tensor:
                             buffer_type = MemRefType.get(
                                 [slot_count] + list(reference_type.shape),
@@ -1224,7 +1274,9 @@ class ComputationGraph:
                                     return True, loop_iv
                             return False, ordinal
 
-                        def materialize_put(stream_put: allo_d.StreamPutOp, ordinal: int):
+                        def materialize_put(
+                            stream_put: allo_d.StreamPutOp, ordinal: int
+                        ):
                             put_value = stream_put.operands[-1]
                             is_dynamic, slot_value = access_slot(stream_put, ordinal)
                             if is_tensor:
@@ -1271,7 +1323,9 @@ class ComputationGraph:
                                 )
                             stream_put.erase()
 
-                        def materialize_get(stream_get: allo_d.StreamGetOp, ordinal: int):
+                        def materialize_get(
+                            stream_get: allo_d.StreamGetOp, ordinal: int
+                        ):
                             get_result = stream_get.result
                             is_dynamic, slot_value = access_slot(stream_get, ordinal)
                             if is_tensor:
@@ -1322,20 +1376,25 @@ class ComputationGraph:
                     for bufferized_stream_info in node.buffered_stream.values():
                         stream_puts = collect_stream_accesses(
                             new_function,
-                            new_function.arguments[
-                                bufferized_stream_info.src_arg_idx
+                            [
+                                new_function.arguments[idx]
+                                for idx in bufferized_stream_info.src_arg_indices
                             ],
                             allo_d.StreamPutOp,
                         )
                         stream_gets = collect_stream_accesses(
                             new_function,
-                            new_function.arguments[
-                                bufferized_stream_info.dst_arg_idx
+                            [
+                                new_function.arguments[idx]
+                                for idx in bufferized_stream_info.dst_arg_indices
                             ],
                             allo_d.StreamGetOp,
                         )
                         if len(stream_puts) == 0 or len(stream_gets) == 0:
-                            continue
+                            raise ValueError(
+                                "Failed to find both endpoints of a buffered stream: "
+                                f"{len(stream_puts)} puts, {len(stream_gets)} gets"
+                            )
                         has_loop = any(
                             get_enclosing_loop(op) is not None
                             for op in stream_puts + stream_gets
@@ -1385,9 +1444,7 @@ class ComputationGraph:
                                         stream_get.erase()
                                         continue
                                 # TODO: support bufferize stream across regions
-                                bufferize_stream_across_regions(
-                                    stream_put, stream_get
-                                )
+                                bufferize_stream_across_regions(stream_put, stream_get)
         # Step4: Clean up unused functions
         for func in self.allo_module.body.operations:
             if isinstance(func, func_d.FuncOp) and "df.kernel" in func.attributes:

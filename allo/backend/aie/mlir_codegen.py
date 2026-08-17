@@ -292,6 +292,75 @@ class CodeGenerator:
                 is_put, is_tensor = False, True
             return is_put, is_tensor
 
+        def get_argument_insertion_scope(argument, requested_nest_depth):
+            """Find an acquire scope that dominates every use of ``argument``.
+
+            ``input_depth`` requests that the acquire be lifted across task
+            nests, but heterogeneous chained kernels can request more lifts
+            than a particular argument actually has. Bound that request by
+            the task nests common to all uses and never walk above this
+            function.
+            """
+            use_ops = [use.owner for use in argument.uses]
+            if len(use_ops) == 0:
+                return None, None
+
+            def get_task_nest_chain(use_op):
+                task_nests = []
+                parent = use_op.parent
+                while parent is not None:
+                    if getattr(parent, "name", None) == "func.func":
+                        if parent != parsed_function.operation:
+                            raise ValueError(
+                                "Argument use belongs to an unexpected function"
+                            )
+                        break
+                    if "task_nest" in parent.attributes:
+                        task_nests.append(parent)
+                    parent = parent.parent
+                else:
+                    raise ValueError("Argument use is not enclosed by its function")
+                task_nests.reverse()
+                return task_nests
+
+            task_nest_chains = [get_task_nest_chain(op) for op in use_ops]
+            common_task_nests = list(task_nest_chains[0])
+            for task_nests in task_nest_chains[1:]:
+                common_len = 0
+                for common_task, task in zip(common_task_nests, task_nests):
+                    if common_task != task:
+                        break
+                    common_len += 1
+                common_task_nests = common_task_nests[:common_len]
+
+            lift_depth = min(max(int(requested_nest_depth), 0), len(common_task_nests))
+            if lift_depth < len(common_task_nests):
+                scope_op = common_task_nests[-lift_depth - 1]
+            else:
+                scope_op = parsed_function.operation
+            scope_block = scope_op.regions[0].blocks[0]
+
+            # Map every use to the operation directly contained in the chosen
+            # scope. The first such operation in block order is a dominating
+            # insertion anchor; argument.uses itself has no ordering contract.
+            anchors = []
+            for use_op in use_ops:
+                anchor = use_op
+                parent = anchor.parent
+                while parent is not None and parent != scope_op:
+                    if getattr(parent, "name", None) == "func.func":
+                        break
+                    anchor = parent
+                    parent = anchor.parent
+                if parent != scope_op:
+                    raise ValueError("Cannot find a common scope for argument uses")
+                anchors.append(anchor)
+
+            for op in scope_block.operations:
+                if any(op == anchor for anchor in anchors):
+                    return op, scope_block
+            raise ValueError("Cannot find an insertion anchor for argument uses")
+
         with aie_ir.InsertionPoint(entry_block):
             index_type = aie_ir.IndexType.get()
             # compute core wrapper: fake while(1)
@@ -314,24 +383,11 @@ class CodeGenerator:
                     nest_depth = (
                         input_arg_depth[i] if input_arg_depth is not None else 0
                     )
-                    # fixme: argument.uses is unordered??
-                    arg_use = list(argument.uses)
-                    first_use = arg_use[-1] if len(arg_use) > 0 else None
-                    if first_use is not None:
-                        first_use_op = first_use.owner
-                        # find parenting nest
-                        while nest_depth > 0:
-                            while "task_nest" not in first_use_op.parent.attributes:
-                                first_use_op = first_use_op.parent
-                            nest_depth -= 1
-                            first_use_op = first_use_op.parent
-                        while (
-                            getattr(first_use_op.parent, "name", None) != "func.func"
-                            and "task_nest" not in first_use_op.parent.attributes
-                        ):
-                            first_use_op = first_use_op.parent
+                    first_use_op, block = get_argument_insertion_scope(
+                        argument, nest_depth
+                    )
+                    if first_use_op is not None:
                         fifo = self.fifo_map[arg_to_fifo[i].name]
-                        block = first_use_op.parent.regions[0].blocks[0]
                         with aie_ir.InsertionPoint(first_use_op):
                             if arg_to_fifo[i].name in reused_fifo_info:
                                 assert block == reused_fifo_info[arg_to_fifo[i].name][1]
