@@ -5,6 +5,7 @@
 from itertools import product
 from collections import defaultdict
 from dataclasses import dataclass
+from math import prod
 
 
 class Axis:
@@ -47,12 +48,61 @@ class Layout:
     class Shard:
         axis: int
 
+        def __mul__(self, other):
+            if isinstance(other, Layout.Shard):
+                return Layout.ShardProduct((self.axis, other.axis))
+            if isinstance(other, Layout.ShardProduct):
+                return Layout.ShardProduct((self.axis,) + other.axes)
+            return NotImplemented
+
+    @dataclass(frozen=True)
+    class ShardProduct:
+        """Ordered mixed-radix sharding of one tensor dimension."""
+
+        axes: tuple[int, ...]
+
+        def __mul__(self, other):
+            if isinstance(other, Layout.Shard):
+                return Layout.ShardProduct(self.axes + (other.axis,))
+            if isinstance(other, Layout.ShardProduct):
+                return Layout.ShardProduct(self.axes + other.axes)
+            return NotImplemented
+
     @dataclass(frozen=True)
     class Replicate:
         pass
 
-    def __init__(self, partitions: list[Replicate | Shard]):
+    def __init__(self, partitions: list[Replicate | Shard | ShardProduct]):
         self.partitions = partitions
+
+    @staticmethod
+    def shard_axes(partition):
+        if isinstance(partition, Layout.Shard):
+            return (partition.axis,)
+        if isinstance(partition, Layout.ShardProduct):
+            return partition.axes
+        if partition is Layout.Replicate or isinstance(partition, Layout.Replicate):
+            return ()
+        raise ValueError(f"Invalid layout partition: {partition}")
+
+    def partition_sizes(self, mesh_dims):
+        """Validate axes and return the number of blocks per tensor dimension."""
+        seen = set()
+        sizes = []
+        for partition in self.partitions:
+            axes = self.shard_axes(partition)
+            for axis in axes:
+                if (
+                    not isinstance(axis, int)
+                    or isinstance(axis, bool)
+                    or not 0 <= axis < len(mesh_dims)
+                ):
+                    raise ValueError(f"Invalid mapping axis {axis}")
+                if axis in seen:
+                    raise ValueError(f"Repeated mapping axis {axis} in layout")
+                seen.add(axis)
+            sizes.append(prod(mesh_dims[axis] for axis in axes))
+        return sizes
 
     def get_placement(self, mesh_dims: list[int]):
         """
@@ -64,6 +114,7 @@ class Layout:
         Returns:
             dict: A mapping from tensor tile IDs to corresponding PE tile coordinates
         """
+        self.partition_sizes(mesh_dims)
         # Generate all possible PE coordinates
         pe_coords = list(product(*[range(dim) for dim in mesh_dims]))
         mapping = defaultdict(list)
@@ -71,13 +122,10 @@ class Layout:
         for pe_coord in pe_coords:
             tensor_id_parts = []
             for partition in self.partitions:
-                if isinstance(partition, Layout.Shard):
-                    # For sharding, use the coordinate at the specified dimension
-                    # start from left to right
-                    tensor_id_parts.append(int(pe_coord[partition.axis]))
-                else:
-                    # For replication, use 0 as placeholder
-                    tensor_id_parts.append(0)
+                block_id = 0
+                for axis in self.shard_axes(partition):
+                    block_id = block_id * mesh_dims[axis] + pe_coord[axis]
+                tensor_id_parts.append(block_id)
 
             tensor_id = tuple(tensor_id_parts)
             # Add this PE coordinate to the mapping for this tensor ID
@@ -285,6 +333,11 @@ class DTensor:
             self.mapping = [
                 axis if isinstance(axis, int) else axis.size for axis in mapping
             ]
+            if any(
+                not isinstance(size, int) or isinstance(size, bool) or size <= 0
+                for size in self.mapping
+            ):
+                raise ValueError("Mapping extents must be positive integers")
         else:
             self.mapping = mapping
         self.shape = shape  # tensor shape
@@ -308,10 +361,18 @@ class DTensor:
                 self.memory = spec
 
         if self.layout is not None and mapping is not None:
+            self.get_local_shape()
             # tensor tile ID -> PE tile IDs
             self.global_placement: dict[
                 tuple[int | str, ...], list[tuple[int, ...]]
             ] = self.layout.get_placement(self.mapping)
+            # Placement is fixed at construction. Rebuilding this reverse
+            # index for every PE makes large spatial task graphs quadratic.
+            self._pe_to_tensor_tile = {
+                pe_id: tensor_tile_id
+                for tensor_tile_id, pe_tile_ids in self.global_placement.items()
+                for pe_id in pe_tile_ids
+            }
         self.access_pattern_set = False
         self.global_id: int = None
         self.is_input: bool = None
@@ -321,19 +382,51 @@ class DTensor:
         """
         Get the local shape of the tensor.
         """
-        if self.layout is None:
+        if self.layout is None or self.mapping is None:
             return self.shape
+        if len(self.shape) != len(self.layout.partitions):
+            raise ValueError("Layout rank must match tensor rank")
         local_shape = []
-        for shape, partition in zip(self.shape, self.layout.partitions):
-            if isinstance(partition, Layout.Shard):
-                local_shape.append(shape // self.mapping[partition.axis])
-            else:
-                local_shape.append(shape)
+        for shape, size in zip(self.shape, self.layout.partition_sizes(self.mapping)):
+            if shape % size:
+                raise ValueError(
+                    f"Tensor extent {shape} must be divisible by shard product {size}"
+                )
+            local_shape.append(shape // size)
         return tuple(local_shape)
 
     def set_global_info(self, global_id: int, is_input: bool):
         self.global_id = global_id
         self.is_input = is_input
+
+    def contiguous_temporal_rows(self):
+        """Number of adjacent row transfers that can share one L2 input tile.
+
+        Only trailing temporal factors of the row shard product qualify, and
+        they must be the innermost axes in this port's traversal. For ATB this
+        groups the rho half-rows while preserving the smaller L1 transfer type.
+        """
+        if self.layout is None or len(self.shape) != 2:
+            return 1
+        row_axes = self.layout.shard_axes(self.layout.partitions[0])
+        trailing = []
+        for axis in reversed(row_axes):
+            if not isinstance(self.axis[axis], Axis.Temporal):
+                break
+            trailing.insert(0, axis)
+        used_axes = {
+            axis
+            for partition in self.layout.partitions
+            for axis in self.layout.shard_axes(partition)
+        }
+        temporal_axes = [
+            i
+            for i, axis in enumerate(self.axis)
+            if i in used_axes and isinstance(axis, Axis.Temporal)
+        ]
+        if not trailing or temporal_axes[-len(trailing) :] != trailing:
+            return 1
+        return prod(self.mapping[axis] for axis in trailing)
 
     def set_access_pattern(self):
         """
@@ -352,23 +445,17 @@ class DTensor:
         # tensor tile ID -> address offset
         self.offset_map: dict[tuple[int | str, ...], Offset4D] = {}
         partition_str = "".join(
-            [
-                "S" if isinstance(p, Layout.Shard) else "R"
-                for p in self.layout.partitions
-            ]
+            ["S" if self.layout.shard_axes(p) else "R" for p in self.layout.partitions]
         )
-        partition_dim = [
-            p.axis if isinstance(p, Layout.Shard) else None
-            for p in self.layout.partitions
-        ]
+        partition_sizes = self.layout.partition_sizes(self.mapping)
         if len(self.shape) == 1:
             if partition_str == "S":
-                dim = partition_dim[0]
+                parts = partition_sizes[0]
                 for i, key in enumerate(sorted(list(self.global_placement.keys()))):
                     self.offset_map[key] = Offset4D(0, 0, i, 0)
-                shard_size = self.shape[0] // self.mapping[dim]
+                shard_size = self.shape[0] // parts
                 device_dims = [2]  # partition idx = 2
-                size = [1, 1, self.mapping[dim], shard_size]
+                size = [1, 1, parts, shard_size]
                 stride = [0, 0, shard_size, 1]
             elif partition_str == "R":
                 for key in self.global_placement.keys():
@@ -381,10 +468,7 @@ class DTensor:
         elif len(self.shape) == 2:
             tensor_m, tensor_n = self.shape  # [tensor_m x tensor_n]
             if partition_str == "SS":
-                device_a, device_b = (
-                    self.mapping[partition_dim[0]],
-                    self.mapping[partition_dim[1]],
-                )
+                device_a, device_b = partition_sizes
                 for i, key in enumerate(sorted(list(self.global_placement.keys()))):
                     self.offset_map[key] = Offset4D(i // device_b, i % device_b, 0, 0)
                 device_dims = [0, 1]
@@ -396,7 +480,7 @@ class DTensor:
                     1,
                 ]
             elif partition_str == "SR":
-                device_a = self.mapping[partition_dim[0]]
+                device_a = partition_sizes[0]
                 for i, key in enumerate(sorted(list(self.global_placement.keys()))):
                     self.offset_map[key] = Offset4D(i // device_a, i % device_a, 0, 0)
                 # First dim sharded across all devices, second replicated
@@ -404,7 +488,7 @@ class DTensor:
                 size = [1, device_a, tensor_m // device_a, tensor_n]
                 stride = [0, (tensor_m // device_a) * tensor_n, tensor_n, 1]
             elif partition_str == "RS":
-                device_b = self.mapping[partition_dim[1]]
+                device_b = partition_sizes[1]
                 for i, key in enumerate(sorted(list(self.global_placement.keys()))):
                     self.offset_map[key] = Offset4D(i // device_b, i % device_b, 0, 0)
                 # First dim replicated, second sharded across second dim of mesh
@@ -431,16 +515,19 @@ class DTensor:
 
         ``pe_tile_id`` contains coordinates for spatial axes only. Temporal
         coordinates are enumerated from ``self.axis`` in outer-to-inner order,
-        with the last temporal axis varying fastest. Duplicate tensor tile IDs
-        are retained because each entry represents a distinct temporal step.
+        with the last applicable temporal axis varying fastest. Axes absent
+        from this port's layout do not advance its cursor: their tile is reused.
         """
-        pe_to_tensor_tile = {
-            pe_id: tensor_tile_id
-            for tensor_tile_id, pe_tile_ids in self.global_placement.items()
-            for pe_id in pe_tile_ids
+        pe_to_tensor_tile = self._pe_to_tensor_tile
+        used_axes = {
+            axis
+            for partition in self.layout.partitions
+            for axis in self.layout.shard_axes(partition)
         }
         temporal_ranges = [
-            range(axis.size) for axis in self.axis if isinstance(axis, Axis.Temporal)
+            range(axis.size if i in used_axes else 1)
+            for i, axis in enumerate(self.axis)
+            if isinstance(axis, Axis.Temporal)
         ]
         tensor_tile_ids = []
         for temporal_tile_id in product(*temporal_ranges):
@@ -460,9 +547,7 @@ class DTensor:
                     f"PE tile ID {pe_tile_id} with temporal coordinates "
                     f"{temporal_tile_id} not found in {self.global_placement}"
                 )
-            # FIXME: this is incorrect! temporal replication should be valid (possible fix: temporal dim default to compressed)
-            if len(tensor_tile_ids) == 0 or pe_to_tensor_tile[logical_pe_tile_id] != tensor_tile_ids[0]:
-                tensor_tile_ids.append(pe_to_tensor_tile[logical_pe_tile_id])
+            tensor_tile_ids.append(pe_to_tensor_tile[logical_pe_tile_id])
         return tensor_tile_ids
 
     def __str__(self):

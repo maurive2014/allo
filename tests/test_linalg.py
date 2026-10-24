@@ -4,7 +4,7 @@
 import numpy as np
 import pytest
 import allo
-from allo.ir.types import int32, float32
+from allo.ir.types import int16, int32, float32
 
 
 def test_math_scalar():
@@ -513,6 +513,21 @@ def test_library_higher_dimension_ops(enable_tensor):
     outp = mod(A, B, C)
     np_outp = kernel(A, B, C)
     np.testing.assert_allclose(outp, np_outp, rtol=1e-5)
+
+
+def test_static_view_dimensions():
+    """Compile-time dimensions reshape contiguous storage without a global."""
+    M, N, rho = 32, 16, 2
+
+    def kernel(A: int16[rho, M // rho, N]) -> int16[M, N]:
+        return allo.view(A, (M, N))
+
+    schedule = allo.customize(kernel)
+    assert "memref.reinterpret_cast" in str(schedule.module)
+    assert "memref.get_global" not in str(schedule.module)
+    module = schedule.build()
+    A = np.arange(M * N, dtype=np.int16).reshape(rho, M // rho, N)
+    np.testing.assert_array_equal(module(A), A.reshape(M, N))
 
 
 def test_layernorm_gelu_ops():

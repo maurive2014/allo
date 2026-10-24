@@ -566,6 +566,7 @@ class ComputationGraph:
         self.func_args = core_func_args
 
         self.dependencies: dict[str, dict[str, int]] = {}
+        self._dependency_users = None
         self.tag_to_func: dict[str, func_d.FuncOp] = {}
 
         df_kernels = []
@@ -642,6 +643,7 @@ class ComputationGraph:
 
         TODO: bundled nodes can be safely reordered
         """
+        self._dependency_users = None
         assert len(node_name_lists) >= 2, "bundle at least two nodes"
         assert all(
             len(t) == len(node_name_lists[0]) for t in node_name_lists
@@ -856,23 +858,44 @@ class ComputationGraph:
         self.func_args[chained_node.meta_data.name] = param_a
         for key, value in param_b.items():
             self.func_args[chained_node.meta_data.name][arg_idx_offset + key] = value
-        dep_a = self.dependencies.pop(node_name_a)
-        dep_b = self.dependencies.pop(node_name_b)
-        for k, v in dep_b.items():
-            dep_a[k] += v
-        self.dependencies[chained_node.meta_data.name] = dep_a
-        for deps in self.dependencies.values():
-            if node_name_a in deps:
-                deps[chained_node.meta_data.name] = deps.pop(node_name_a)
-            if node_name_b in deps:
-                deps[chained_node.meta_data.name] = deps.pop(node_name_b)
-        for stream in self.edges.values():
+        self._chain_dependencies(node_name_a, node_name_b, chained_node.meta_data.name)
+        # Only incident streams can refer to either chained node. Scanning the
+        # entire graph for each pair makes large virtual mappings quadratic.
+        for stream in (
+            chained_node.meta_data.input_streams + chained_node.meta_data.output_streams
+        ):
             if stream.src in (node_name_a, node_name_b):
                 stream.src = chained_node.meta_data.name
             if stream.dst in (node_name_a, node_name_b):
                 stream.dst = chained_node.meta_data.name
         self.nodes[chained_node.meta_data.name] = chained_node
         return chained_node.meta_data.name
+
+    def _chain_dependencies(self, name_a, name_b, chained_name):
+        """Update dependencies using an index of the dictionaries that use a key."""
+        if self._dependency_users is None:
+            self._dependency_users = defaultdict(set)
+            for owner, deps in self.dependencies.items():
+                for dependency in deps:
+                    self._dependency_users[dependency].add(owner)
+        users = self._dependency_users
+        dep_a = self.dependencies.pop(name_a)
+        dep_b = self.dependencies.pop(name_b)
+        for dependency in dep_a:
+            users[dependency].discard(name_a)
+        for dependency in dep_b:
+            users[dependency].discard(name_b)
+        for dependency, count in dep_b.items():
+            dep_a[dependency] += count
+        self.dependencies[chained_name] = dep_a
+        for dependency in dep_a:
+            users[dependency].add(chained_name)
+        # Preserve the existing replacement order, including overlapping keys.
+        for old_name in (name_a, name_b):
+            for owner in users.pop(old_name, set()):
+                deps = self.dependencies[owner]
+                deps[chained_name] = deps.pop(old_name)
+                users[chained_name].add(owner)
 
     def refactor(self):
         """

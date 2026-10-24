@@ -665,6 +665,103 @@ The local tensor shape at each PE is automatically computed:
 For replicated dimensions, the local shape equals the global shape for that dimension.
 
 
+Spatial and Temporal Sharding (AIE)
+==================================
+
+Typed mapping axes distinguish physical parallelism from repeated transfers
+within a kernel. Import ``Axis`` from ``allo.memory``. Only spatial axes create
+kernel instances and contribute coordinates to ``df.get_pid()``. Layout
+indices refer to the complete logical mapping, including temporal axes.
+
+Several axes can shard one tensor dimension through an ordered product:
+``S(0) * S(3)`` first partitions by axis 0, then partitions each resulting
+block by axis 3. For extents ``E0, E3`` and coordinates ``c0, c3``, the block
+index is ``c0 * E3 + c3``. Reversing the product changes ownership. Extents
+must divide exactly, and an axis may occur only once in a tensor's layout.
+
+Tensor kernel arguments are port handles. ``get()`` returns a compiler-inferred
+leaf tile; ``put(value)`` writes a tile. Each port traverses only the temporal
+axes present in its layout, in mapping order, with the last applicable axis
+varying fastest. An invariant input must be fetched outside the loop that
+reuses it. The current implementation uses ordinary ``range`` loops for this
+default order; axis-object ``meta_for`` and traversal overrides are not supported.
+
+Asymmetric Tile Buffering (rho = 2)
+-----------------------------------
+
+ATB retains a full output-C tile while consuming two half-height A tiles per
+K step. B is fetched once for both halves. A spatial M/N mesh computes separate
+output tiles concurrently, while K and rho execute temporally on each PE:
+
+.. code-block:: python
+
+    import allo
+    import allo.dataflow as df
+    from allo.ir.types import int16
+    from allo.memory import Axis, Layout
+
+    S = Layout.Shard
+    M = N = K = 128
+    Pm = Pn = Pk = 4
+    rho = 2
+    Mt, Nt, Kt = M // Pm, N // Pn, K // Pk
+    At = Mt // rho
+    Sm, Sn = Axis.Spatial(Pm, "m"), Axis.Spatial(Pn, "n")
+    Tk, Tr = Axis.Temporal(Pk, "k"), Axis.Temporal(rho, "rho")
+    LyA = [S(0) * S(3), S(2)]
+    LyB = [S(2), S(1)]
+    LyC = [S(0), S(1)]
+
+    @df.region()
+    def top(A: int16[M, K], B: int16[K, N], C: int16[M, N]):
+        @df.kernel(mapping=[Sm, Sn, Tk, Tr], args=[A, B, C])
+        def gemm(A_port: int16[M, K] @ LyA,
+                 B_port: int16[K, N] @ LyB,
+                 C_port: int16[M, N] @ LyC):
+            acc: int16[rho, At, Nt] = 0
+            for k in range(Pk):
+                b: int16[Kt, Nt] = B_port.get()
+                for r in range(rho):
+                    a: int16[At, Kt] = A_port.get()
+                    current: int16[At, Nt]
+                    current[:, :] = acc[r, :, :]
+                    partial: int16[At, Nt] = allo.matmul(a, b)
+                    acc[r, :, :] = allo.add(current, partial)
+            C_port.put(allo.view(acc, (Mt, Nt)))
+
+Each PE consumes ``Pk * rho`` A tiles, ``Pk`` B tiles, and produces one C tile.
+For these defaults, A is ``16 x 32`` in L1 and C is ``32 x 32``. The backend
+groups consecutive A row transfers into ``32 x 32`` L2 objects and splits them
+into half-height L1 objects, preserving the full row extent at L2. Dynamic
+object-FIFO lowering keeps temporal loop bodies compact.
+
+The runnable example is ``tests/dataflow/aie/test_temporal_atb_gemm.py``. In the
+AIE container, run it directly for a 128-square problem or pass
+``--m 256 --n 256 --k 256`` for a 256-square problem. To run a 1024-square
+problem, pass ``--m 1024 --n 1024 --k 1024``. The example automatically selects
+a 16x16 logical output grid with 64x64 C tiles and 32-wide K tiles, then uses
+``bundle`` mapping primitives to place 16 logical tiles on each of 16 physical
+cores. Temporal K/rho axes remain inside each kernel; they require no chains.
+``--pm``, ``--pn``, and ``--pk`` override the logical partition counts, subject
+to exact divisibility and per-core buffer capacity. ``--check-only`` runs
+compiler checks without executing the device; ``--build-only`` compiles the
+bitstream without executing it. The example uses signed 16-bit accumulation
+and small test values to avoid overflow. For this zero-initialized full-plane
+update pattern, the AIE compiler retains C in the packed microkernel layout,
+updates rho planes directly, and folds the final unpacking into output DMA.
+It borrows B's FIFO buffer across the nested rho loop and reuses the C output
+FIFO through its full contiguous reshape. These optimizations require known
+uses and bounded buffer lifetimes; unsupported alias or control-flow patterns
+retain the existing lowering.
+
+The existing ``ENABLE_AGGRESSIVE_PORT_UTILIZATION_PATCH=1`` option also works
+with this temporal ATB example. At ``--pm 32 --pn 16 --pk 16`` for 1024-square
+matrices, it spreads B across four shim/memory-tile routes without changing
+compute tile sizes. Optional row aggregation falls back to the original FIFO
+objects when the aggregated row count exceeds the shim's 1023 limit. Outer
+DMA dimensions batch the original temporal transfers in order instead.
+
+
 Best Practices
 ==============
 
@@ -683,3 +780,25 @@ Best Practices
 
 5. **Use ConstExpr for tile sizes**: When computing tile boundaries, use
    ``ConstExpr`` for values that should be computed at compile time.
+
+AIE output buffering
+--------------------
+
+``df.build(..., target="aie", output_fifo_depth=1)`` uses one FIFO object at
+compute producers of global outputs. The default is ``2``. Input FIFOs,
+inter-core streams, and memory-tile/shim endpoints keep their existing depths.
+This option applies equally to library GEMM and temporal tensor-port kernels,
+including symmetric (rho=1) and asymmetric buffering.
+
+Single buffering saves one local output tile per core. A producer must wait
+for output DMA to release that object before accumulating the next tile, so
+capacity savings can reduce computation/output overlap. Feasibility still
+requires room for inputs, stack, and control state; benchmark both policies
+with the intended workload. Only depths 1 and 2 are supported.
+
+``fifo_lowering="auto"`` preserves the existing AIE FIFO-lowering heuristic.
+For controlled scheduling experiments, ``fifo_lowering="static"`` resolves
+buffer selection at compile time, while ``"dynamic"`` uses runtime index state.
+Both modes apply to symmetric and asymmetric kernels. Static lowering can
+increase code size through loop expansion; a successful hardware build is
+required to establish program-memory feasibility for each configuration.

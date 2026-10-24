@@ -53,7 +53,8 @@ class Config:
     DMA_MAX_BDS = 16
 
     # https://github.com/Xilinx/mlir-aie/blob/v1.0/lib/Dialect/AIEX/IR/AIEXDialect.cpp#L233
-    SHIM_DMA_HARDWARE_MAX_SIZES = [64, -1, 1024, 1024]
+    # MLIR-AIE bounds the row size (axis 2) at 1023, inclusive.
+    SHIM_DMA_HARDWARE_MAX_SIZES = [64, -1, 1023, 1024]
     MAX_IO_BUFFER = 4  # leave one for trace (https://github.com/Xilinx/mlir-aie/blob/v1.0/programming_guide/section-3/README.md#host-code)
     # TODO: other dma size/stride constrain
 

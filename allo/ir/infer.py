@@ -840,8 +840,10 @@ class TypeInferer(ASTVisitor):
                     f"Argument name '{arg.arg}' conflicts with an existing symbol. "
                     f"Please choose a different name to avoid the conflict."
                 )
-                if ctx.mapping is not None: # kernel ports
-                    arg.dtype = Stream(dtype=arg.dtype, shape=arg.dtensor.get_local_shape(), depth=2)
+                if ctx.mapping is not None:  # kernel ports
+                    arg.dtype = Stream(
+                        dtype=arg.dtype, shape=arg.dtensor.get_local_shape(), depth=2
+                    )
                 else:
                     arg.shape = arg.dtensor.get_local_shape()
                 ctx.put_symbol(name=arg.arg, val=arg)
@@ -1338,7 +1340,9 @@ class TypeInferer(ASTVisitor):
         if op_name in {"view"}:
             axes = compile(ast.Expression(new_args[1]), "", "eval")
             # pylint: disable=eval-used
-            axes = eval(axes)
+            axes = eval(axes, ctx.global_vars)
+            if np.prod(axes) != np.prod(new_args[0].shape):
+                raise ValueError("View must preserve the number of tensor elements")
             node.shape = axes
             node.dtype = new_args[0].dtype
             return node

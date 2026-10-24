@@ -3,10 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import re
 import copy
 from typing import Any, Union
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import numpy as np
 
 # =======================
@@ -14,6 +15,7 @@ import numpy as np
 import aie.dialects.aie as aie_d
 import aie.dialects.aiex as aiex_d
 import aie.dialects.arith as aie_arith_d
+import aie.dialects.memref as aie_memref_d
 import aie.dialects.func as aie_func_d
 import aie.dialects.scf as aie_scf_d
 import aie.ir as aie_ir
@@ -30,6 +32,7 @@ from ..._mlir.ir import InsertionPoint, MemRefType, IntegerType
 
 from ..utils import format_str
 from ...memory import (
+    Axis,
     DTensor,
     Offset4D,
     Size4D,
@@ -55,6 +58,117 @@ from .mapping import (
     FIFO,
     FIFOManager,
 )
+
+
+def _is_builtin_matmul(name):
+    return (
+        re.fullmatch(
+            r"matmul_(?:scalar_)?(?:i\d+|bf16|f32)_(?:i\d+|bf16|f32)(?:_slice_\d+x\d+x\d+)?",
+            name,
+        )
+        is not None
+    )
+
+
+def _input_fifo_use_scope(copy_op, exclusive):
+    """Return the scope after which a single-use input FIFO can be released."""
+    value = copy_op.operands[1]
+    uses = [use.owner for use in value.uses if use.owner != copy_op]
+    if len(uses) != 1:
+        return None
+    consumer = uses[0]
+    if consumer.parent == copy_op.parent:
+        return consumer
+    # The old same-block fast path is unchanged. Extending a borrow through
+    # loops additionally requires a known read-only use and an exclusive FIFO:
+    # another argument sharing this FIFO could otherwise acquire it while held.
+    if not (
+        exclusive
+        and consumer.name == "func.call"
+        and "callee" in consumer.attributes
+        and _is_builtin_matmul(consumer.attributes["callee"].value)
+        and len(consumer.operands) in (3, 4)
+        and consumer.operands[2] != value
+    ):
+        return None
+    scope = consumer
+    while scope.parent != copy_op.parent:
+        scope = scope.parent
+        if scope.name not in ("affine.for", "scf.for"):
+            return None
+    return scope
+
+
+def _output_view_allocation(copy_op):
+    """Find private storage behind a full, contiguous output reshape.
+
+    The output must be its last use. Reject partial/dynamic views, branches,
+    escaping aliases, and unknown calls before extending the FIFO lifetime.
+    """
+    value = copy_op.operands[0]
+    views = []
+    while getattr(value.owner, "name", None) == "memref.reinterpret_cast":
+        view = value.owner
+        source = view.operands[0]
+        src_type = aie_ir.MemRefType(source.type)
+        dst_type = aie_ir.MemRefType(value.type)
+        strides = []
+        stride = 1
+        for dim in reversed(dst_type.shape):
+            strides.insert(0, stride)
+            stride *= dim
+        if (
+            len(view.operands) != 1
+            or list(view.attributes["static_offsets"]) != [0]
+            or list(view.attributes["static_sizes"]) != list(dst_type.shape)
+            or list(view.attributes["static_strides"]) != strides
+            or any(d <= 0 for d in list(src_type.shape) + list(dst_type.shape))
+            or np.prod(src_type.shape) != np.prod(dst_type.shape)
+            or src_type.element_type != dst_type.element_type
+            or src_type.memory_space != dst_type.memory_space
+            or len(list(value.uses)) != 1
+        ):
+            return None
+        views.append(view)
+        value = source
+    alloc = value.owner
+    if not views or getattr(alloc, "name", None) != "memref.alloc":
+        return None
+    root_type = aie_ir.MemRefType(value.type)
+    if root_type.layout.value != aie_ir.AffineMap.get_identity(
+        len(root_type.shape), context=root_type.context
+    ):
+        return None
+    if alloc.parent != copy_op.parent or any(v.parent != alloc.parent for v in views):
+        return None
+    body = list(alloc.parent.regions[0].blocks[0].operations)
+    body = [getattr(op, "operation", op) for op in body]
+    end = body.index(copy_op.operation)
+    for use in value.uses:
+        consumer = use.owner
+        if consumer in views:
+            continue
+        if consumer.name != "func.call" or "callee" not in consumer.attributes:
+            return None
+        name = consumer.attributes["callee"].value
+        if not (
+            (_is_builtin_matmul(name) and use.operand_number == 2)
+            or (
+                re.fullmatch(
+                    r"fill_zeros_(?:i\d+|bf16|f32)_\d+_\d+_vector(?:_planes_\d+)?", name
+                )
+                and use.operand_number == 0
+            )
+        ):
+            return None
+        scope = consumer
+        while scope.parent != alloc.parent:
+            scope = scope.parent
+            if scope.name not in ("affine.for", "scf.for"):
+                return None
+        if not body.index(alloc.operation) < body.index(scope.operation) < end:
+            return None
+    return alloc
 
 
 @dataclass(frozen=True)
@@ -84,7 +198,11 @@ class CodeGenerator:
         core_func_args: dict[str, dict[int, tuple[Argument, bool]]],
         streams: dict[str, Stream],
         virtual_computation_graph: ComputationGraph = None,
+        output_fifo_depth: int = 2,
+        fifo_lowering: str = "auto",
     ):
+        self.fifo_lowering = fifo_lowering
+        self.output_fifo_depth = output_fifo_depth
         self.device_type = device_type
         self.device_config = device_config_map[device_type]
         assert self.device_config is not None, "Unsupported device type"
@@ -411,6 +529,35 @@ class CodeGenerator:
                         op = uses_[0].owner
                         if is_put:
                             alloc_op = op.operands[0].owner
+                            view_alloc = (
+                                _output_view_allocation(op) if len(args) == 1 else None
+                            )
+                            if view_alloc is not None:
+                                root = view_alloc.result
+                                root_type = aie_ir.MemRefType(root.type)
+                                strides = []
+                                stride = 1
+                                for dim in reversed(root_type.shape):
+                                    strides.insert(0, stride)
+                                    stride *= dim
+                                with aie_ir.InsertionPoint(view_alloc.operation):
+                                    acquired = fifo.acquire(0, 1)
+                                    replacement = aie_memref_d.ReinterpretCastOp(
+                                        root.type,
+                                        acquired,
+                                        [],
+                                        [],
+                                        [],
+                                        [0],
+                                        list(root_type.shape),
+                                        strides,
+                                    ).result
+                                root.replace_all_uses_with(replacement)
+                                with aie_ir.InsertionPoint(op.operation):
+                                    fifo.release(0, 1)
+                                op.erase()
+                                view_alloc.erase()
+                                continue
                             if getattr(alloc_op, "name", None) == "memref.alloc":
                                 with aie_ir.InsertionPoint(alloc_op.operation):
                                     acquired = fifo.acquire(0, 1)
@@ -424,23 +571,19 @@ class CodeGenerator:
                         elif is_tensor and len(list(op.operands[0].uses)) == 1:
                             alloc_op = op.operands[1].owner
                             if getattr(alloc_op, "name", None) == "memref.alloc":
-                                result_uses = [
-                                    use.owner
-                                    for use in op.operands[1].uses
-                                    if not use.owner == op
-                                ]
-                                # Due to MLIR Python binding limitations, the last use cannot be reliably determined. Restrict to the single-use case.
-                                if len(result_uses) == 1 and result_uses[0].parent == op.parent:
+                                use_scope = _input_fifo_use_scope(op, len(args) == 1)
+                                if use_scope is not None:
                                     with aie_ir.InsertionPoint(op):
                                         acquired = fifo.acquire(1, 1)
                                     op.operands[1].replace_all_uses_with(acquired)
                                     op.erase()
-                                    acquired_uses = list(acquired.uses)
-                                    use_op = acquired_uses[0].owner.operation
+                                    use_op = use_scope.operation
                                     # ensure 'release' happens after use
                                     with aie_ir.InsertionPoint(use_op):
                                         cloned = use_op.clone()
-                                        for old, new in zip(use_op.results, cloned.results):
+                                        for old, new in zip(
+                                            use_op.results, cloned.results
+                                        ):
                                             old.replace_all_uses_with(new)
                                         fifo.release(1, 1)
                                     use_op.erase()
@@ -1511,6 +1654,7 @@ class CodeGenerator:
                             stride=stride,
                         )
                     )
+        self.coalesce_temporal_input_rows(global_io_port)
         if os.getenv("VERBOSE") == "1":
             print("## global_dma_trough_port")
             for ele in self.global_dma_trough_port:
@@ -1525,6 +1669,81 @@ class CodeGenerator:
                 dict_[idx] = interface_map[interface]
             global_arg_idx_to_interface[func_name] = dict_
         return global_arg_idx_to_interface
+
+    def coalesce_temporal_input_rows(self, io_ports):
+        """Keep adjacent temporal row slices together in L2, split them in L1.
+
+        A one-to-one object-FIFO link can consume a large memory-tile object
+        through several smaller compute-tile objects. Restrict aggregation to
+        one multicast interface and prove that every group has adjacent global
+        rows, the same token, and identical transfer geometry before changing
+        either the DMA tasks or the FIFO size.
+        """
+        for port in io_ports:
+            if not port.is_input or len(port.connect_interface) != 1:
+                continue
+            tasks = [
+                task for task in self.global_dma_trough_port if task.io_port is port
+            ]
+            if not tasks:
+                continue
+            factor = tasks[0].dtensor.contiguous_temporal_rows()
+            if factor == 1 or len(tasks) % factor:
+                continue
+            # Aggregation is optional. Keep the original FIFO objects and
+            # temporal tasks if a full row group cannot be encoded by the shim
+            # DMA. In particular, port spreading exposes B's complete K
+            # traversal here: 16 x 64 rows must not become a 1024-row object.
+            # The regular task coalescer can still batch those original tiles
+            # on an outer descriptor axis without changing their stream order.
+            if any(
+                task.size[2] * factor > Config.SHIM_DMA_HARDWARE_MAX_SIZES[2]
+                for task in tasks
+            ):
+                continue
+            groups = [tasks[i : i + factor] for i in range(0, len(tasks), factor)]
+            valid = True
+            for group in groups:
+                first = group[0]
+                # Row/column block coordinates occupy the first two DMA axes;
+                # the two innermost axes address elements within a leaf tile.
+                if first.size[:2] != [1, 1]:
+                    valid = False
+                    break
+                for i, task in enumerate(group):
+                    expected_offset = list(first.offset)
+                    expected_offset[0] += i
+                    if (
+                        task.dtensor is not first.dtensor
+                        or task.token != first.token
+                        or task.size != first.size
+                        or task.stride != first.stride
+                        or task.offset != expected_offset
+                    ):
+                        valid = False
+                        break
+            if not valid:
+                continue
+            replacements = {}
+            skipped = set()
+            for group in groups:
+                first = group[0]
+                size = list(first.size)
+                size[2] *= factor
+                replacements[id(first)] = replace(
+                    first,
+                    size=size,
+                    start_time=min(task.start_time for task in group),
+                    end_time=max(task.end_time for task in group),
+                )
+                skipped.update(id(task) for task in group[1:])
+            self.global_dma_trough_port = [
+                replacements.get(id(task), task)
+                for task in self.global_dma_trough_port
+                if id(task) not in skipped
+            ]
+            port.size[2] *= factor
+            port.fifo.data_shape[2] *= factor
 
     # ------------------------------------------------------------
     # Compute Tile
@@ -1841,7 +2060,14 @@ class CodeGenerator:
                         dma_fifo.name,
                         self.tile_map[dma_fifo.src],
                         [self.tile_map[node] for node in dma_fifo.dst],
-                        depth=dma_fifo.depth,
+                        # Only the compute producer changes depth. Keep the
+                        # memory-tile endpoint double buffered for linked DMA.
+                        depth=(
+                            [self.output_fifo_depth, dma_fifo.depth]
+                            if self.output_fifo_depth != 2
+                            and dma_fifo.src in self.core_func_args
+                            else dma_fifo.depth
+                        ),
                         datatype=aie_ir.MemRefType.get(
                             dma_fifo.data_shape,
                             get_aie_mlir_dtype_from_str(str(dma_fifo.dtype)),
@@ -1883,6 +2109,25 @@ class CodeGenerator:
                             else None
                         ),
                     )
+                    # Keep temporal traversal loops compact. Static FIFO lowering
+                    # clones their bodies for each buffer state, which can exceed
+                    # instruction memory for nested temporal axes (e.g. ATB).
+                    if self.fifo_lowering != "auto":
+                        func_core.attributes["dynamic_objfifo_lowering"] = (
+                            aie_ir.BoolAttr.get(self.fifo_lowering == "dynamic")
+                        )
+                    elif any(
+                        isinstance(arg, Argument)
+                        and arg.dtensor is not None
+                        and sum(
+                            isinstance(axis, Axis.Temporal) for axis in arg.dtensor.axis
+                        )
+                        > 1
+                        for arg, _ in self.core_func_args[func_name].values()
+                    ):
+                        func_core.attributes["dynamic_objfifo_lowering"] = (
+                            aie_ir.BoolAttr.get(True)
+                        )
                     if self.global_ip is None:
                         self.global_ip = aie_ir.InsertionPoint(func_core)
                     self.build_core_function(

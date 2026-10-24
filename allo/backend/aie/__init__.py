@@ -32,7 +32,7 @@ from ..._mlir.passmanager import PassManager as mlir_pass_manager
 from ...memory import DTensor
 from ...utils import construct_kernel_name
 from .external_kernel import ExternalModule, ExternalModuleBase
-from .mlir_codegen import CodeGenerator
+from .mlir_codegen import CodeGenerator, _is_builtin_matmul
 from .vliw import vliw
 from .utils import (
     Argument,
@@ -232,6 +232,263 @@ def _promote_loop_carried_layout_transformations(function):
     visit(function)
 
 
+def _promote_sliced_matmul_accumulators(module, function):
+    """Keep zero-initialized, whole-plane matmul accumulators packed.
+
+    Only private [planes, M, N] accumulators whose complete use graph is a
+    zero fill, one matched slice update, and a full output view are eligible.
+    A generated pointer-offset wrapper preserves the bare-pointer kernel ABI;
+    passing a strided memref directly would lose its dynamic offset there.
+    """
+
+    def op_of(value):
+        return _as_operation(value.owner)
+
+    def users(value):
+        return {_as_operation(use.owner) for use in value.uses}
+
+    def ints(op, attr):
+        return list(op.attributes[attr])
+
+    def walk(op):
+        for region in op.regions:
+            for block in region.blocks:
+                for child in list(block.operations):
+                    yield _as_operation(child)
+                    yield from walk(child)
+
+    changed = False
+    for alloc in [
+        op
+        for op in walk(function)
+        if op.name == "memref.alloc" and len(MemRefType(op.result.type).shape) == 3
+    ]:
+        typ = MemRefType(alloc.result.type)
+        if len(typ.shape) != 3 or any(d <= 0 for d in typ.shape):
+            continue
+        if typ.layout.value != allo_ir.ir.AffineMap.get_identity(
+            3, context=function.context
+        ):
+            continue
+        planes, rows, cols = typ.shape
+        if planes * rows * cols >= 2**31:
+            continue
+        acc_users = users(alloc.result)
+        fills = [op for op in acc_users if op.name == "linalg.fill"]
+        slices = [op for op in acc_users if op.name == "memref.subview"]
+        views = [op for op in acc_users if op.name == "memref.reinterpret_cast"]
+        if len(fills) != 1 or len(slices) not in (1, 2) or len(views) != 1:
+            continue
+        if acc_users != set(fills + slices + views):
+            continue
+        fill, view = fills[0], views[0]
+        zero = op_of(fill.operands[0])
+        if zero.name != "arith.constant" or str(zero.attributes["value"]) not in (
+            "0 : i16",
+            "0 : i32",
+            "0 : i8",
+            "0.000000e+00 : f32",
+            "0.000000e+00 : bf16",
+        ):
+            continue
+        if fill.parent != alloc.parent or view.parent != alloc.parent:
+            continue
+        output_type = MemRefType(view.result.type)
+        if (
+            list(output_type.shape) != [planes * rows, cols]
+            or ints(view, "static_offsets") != [0]
+            or ints(view, "static_sizes") != [planes * rows, cols]
+            or ints(view, "static_strides") != [cols, 1]
+        ):
+            continue
+        puts = list(users(view.result))
+        if len(puts) != 1 or puts[0].name != "allo.stream_put":
+            continue
+        if puts[0].parent != view.parent:
+            continue
+        first = slices[0]
+        if any(
+            ints(s, "static_sizes") != [1, rows, cols]
+            or ints(s, "static_strides") != [1, 1, 1]
+            or ints(s, "static_offsets")[1:] != [0, 0]
+            or len(s.operands) != 2
+            or list(s.operands) != list(first.operands)
+            or s.attributes["static_offsets"] != first.attributes["static_offsets"]
+            or s.parent != first.parent
+            for s in slices
+        ):
+            continue
+        slice_users = set().union(*(users(s.result) for s in slices))
+        reads = [
+            op
+            for op in slice_users
+            if op.name == "memref.copy" and op.operands[0] in [s.result for s in slices]
+        ]
+        writes = [
+            op
+            for op in slice_users
+            if op.name == "memref.copy" and op.operands[1] in [s.result for s in slices]
+        ]
+        if len(reads) != 1 or len(writes) != 1 or slice_users != set(reads + writes):
+            continue
+        read, write = reads[0], writes[0]
+        scratch = read.operands[1]
+        if op_of(scratch).name != "memref.alloc":
+            continue
+        to_ops = [op for op in users(scratch) if op.name == "allo.transform_layout"]
+        if len(to_ops) != 1 or users(scratch) != {read, to_ops[0]}:
+            continue
+        to = to_ops[0]
+        back = op_of(write.operands[0])
+        if back.name != "allo.transform_layout" or not is_inverse_transform_layout(
+            back, to
+        ):
+            continue
+        if back.operands[0] != to.result or users(back.result) != {write}:
+            continue
+        calls = [op for op in users(to.result) if op.name == "func.call"]
+        if len(calls) != 1 or users(to.result) != {back, calls[0]}:
+            continue
+        call = calls[0]
+        name = call.attributes["callee"].value
+        if (
+            name not in module.injected_external_kernels
+            or not _is_builtin_matmul(name)
+            or len(call.operands) != 3
+            or call.operands[2] != to.result
+            or to.result in call.operands[:2]
+        ):
+            continue
+        if any(op.parent != first.parent for op in (read, to, call, back, write)):
+            continue
+        # Require the exact blocked-matrix permutation, not merely a hint.
+        sizes = ints(to, "sizes")
+        if len(sizes) != 4:
+            continue
+        rm, cn, micro_m, micro_n = sizes
+        if (
+            rm * micro_m != rows
+            or cn * micro_n != cols
+            or ints(to, "offsets") != [0] * 4
+            or ints(to, "strides") != [micro_m * cols, micro_n, cols, 1]
+            or ints(back, "offsets") != [0] * 4
+            or ints(back, "sizes") != [rm, micro_m, cn, micro_n]
+            or ints(back, "strides") != [micro_m * cols, micro_n, micro_m * micro_n, 1]
+        ):
+            continue
+        # Prove ordering and reject branches/escaping scopes. Only counted
+        # loops may surround the update; initialization precedes all updates.
+        scope = first
+        while scope.parent != alloc.parent and scope.parent.name in (
+            "affine.for",
+            "scf.for",
+        ):
+            scope = scope.parent
+        if scope.parent != alloc.parent:
+            continue
+        siblings = list(alloc.parent.regions[0].blocks[0].operations)
+        siblings = [_as_operation(op) for op in siblings]
+        if not (
+            siblings.index(fill)
+            < siblings.index(scope)
+            < siblings.index(view)
+            < siblings.index(puts[0])
+        ):
+            continue
+        body = [
+            _as_operation(op) for op in first.parent.regions[0].blocks[0].operations
+        ]
+        if not (
+            body.index(read)
+            < body.index(to)
+            < body.index(call)
+            < body.index(back)
+            < body.index(write)
+        ):
+            continue
+        with function.context, allo_ir.ir.Location.unknown():
+            from ..._mlir.dialects import arith as arith_d
+            from ..._mlir.ir import IntegerType
+            from .utils import external_kernel_aie2c_type
+
+            offset_name = f"{name}_slice_{planes}x{rows}x{cols}"
+            zero_name = f"fill_zeros_{str(typ.element_type)}_{planes * rows}_{cols}_vector_planes_{planes}"
+            ctype_a = external_kernel_aie2c_type[
+                str(call.operands[0].type.element_type)
+            ]
+            ctype_b = external_kernel_aie2c_type[
+                str(call.operands[1].type.element_type)
+            ]
+            ctype_c = external_kernel_aie2c_type[str(typ.element_type)]
+            index_type = IntegerType.get_signless(32)
+            node = module.virtual_computation_graph.nodes[function.name.value]
+            for symbol, types, code, include, inputs, outputs in (
+                (
+                    offset_name,
+                    [call.operands[0].type, call.operands[1].type, typ, index_type],
+                    f"void {offset_name}({ctype_a} *a, {ctype_b} *b, {ctype_c} *c, int32_t slice) {{\n"
+                    f"  {name}(a, b, c + slice * {rows * cols});\n}}\n",
+                    module.include_src[name],
+                    [0, 1, 3],
+                    [2],
+                ),
+                (
+                    zero_name,
+                    [typ],
+                    f"void {zero_name}({ctype_c} *c) {{\n"
+                    f"  zero_vectorized<{ctype_c}, {planes * rows}, {cols}>(c);\n}}\n",
+                    f'#include "{"aie2" if module.device == "npu1" else "aie2p"}/zero.cc"\n',
+                    [],
+                    [0],
+                ),
+            ):
+                if symbol not in module.injected_external_kernels:
+                    module.injected_external_kernels[symbol] = ExternalModuleBase(
+                        symbol, inputs, outputs, code
+                    )
+                    module.include_src[symbol] = include
+                    decl = allo_func_d.FuncOp(
+                        symbol,
+                        allo_func_d.FunctionType.get(types, []),
+                        ip=InsertionPoint(function),
+                    )
+                    decl.attributes["sym_visibility"] = StringAttr.get("private")
+                node.meta_data.used_external_kernel.add(symbol)
+            slice_index = arith_d.IndexCastOp(
+                index_type, first.operands[1], ip=InsertionPoint(call)
+            )
+            allo_func_d.CallOp(
+                [],
+                FlatSymbolRefAttr.get(offset_name),
+                [call.operands[0], call.operands[1], alloc.result, slice_index.result],
+                ip=InsertionPoint(call),
+            )
+            allo_func_d.CallOp(
+                [],
+                FlatSymbolRefAttr.get(zero_name),
+                [alloc.result],
+                ip=InsertionPoint(fill),
+            )
+            # Unpack exactly once, at the output boundary. The DMA pass can
+            # fold this permutation into the output FIFO's stream layout.
+            unpack = allo_d.transform_layout(
+                view.result.type,
+                view.result,
+                [0] * 4,
+                [planes * rm, micro_m, cn, micro_n],
+                [micro_m * cols, micro_n, micro_m * micro_n, 1],
+                ip=InsertionPoint(puts[0]),
+            )
+            puts[0].operands[1] = unpack
+            for op in (write, back, call, to, read, fill):
+                op.erase()
+            for s in slices:
+                s.erase()
+            op_of(scratch).erase()
+            changed = True
+    return changed
+
+
 class AIE_MLIRModule:
     # ############################################################
     # Construction
@@ -308,7 +565,9 @@ class AIE_MLIRModule:
                     arg.type_as_param = arg.get_local_shape()
                     stream.is_tensor = len(arg.type_as_param) > 0
                     with self.allo_module.context, allo_ir.ir.Location.unknown():
-                        stream.allo_element_type = MemRefType.get(arg.type_as_param, arg.dtype.build())
+                        stream.allo_element_type = MemRefType.get(
+                            arg.type_as_param, arg.dtype.build()
+                        )
                     argument = Argument(arg, stream)
                     self.func_args[func_name].append(argument)
                     tmp_map[arg] = argument
@@ -424,11 +683,11 @@ class AIE_MLIRModule:
                     for use in arg.uses:
                         use_op = getattr(use.owner, "name", None)
                         if use_op == "allo.stream_put":
-                            assert (is_put is None or is_put)
+                            assert is_put is None or is_put
                             is_put = True
                         else:
                             assert use_op == "allo.stream_get"
-                            assert (is_put is None or not is_put)
+                            assert is_put is None or not is_put
                             is_put = False
                     if is_put is None:
                         continue
@@ -868,6 +1127,13 @@ class AIE_MLIRModule:
         with self.allo_module.context:
             mlir_pass_manager.parse(pipeline).run(self.allo_module.operation)
 
+        for func in list(self.allo_module.body.operations):
+            if isinstance(func, allo_func_d.FuncOp) and "df.kernel" in func.attributes:
+                if _promote_sliced_matmul_accumulators(self, func):
+                    optimize_layout_transformation(func)
+        with self.allo_module.context:
+            mlir_pass_manager.parse(pipeline).run(self.allo_module.operation)
+
         # record optimized allo mlir
         with open(
             os.path.join(self.project_dir, "original_opt.mlir"), "w", encoding="utf-8"
@@ -883,7 +1149,13 @@ class AIE_MLIRModule:
         num_iters: int = 100,
         trace: list[tuple[str, tuple[int, ...]]] = None,
         trace_size: int = 4096,
+        output_fifo_depth: int = 2,
+        fifo_lowering: str = "auto",
     ):
+        if type(output_fifo_depth) is not int or output_fifo_depth not in (1, 2):
+            raise ValueError("output_fifo_depth must be 1 or 2")
+        if fifo_lowering not in ("auto", "static", "dynamic"):
+            raise ValueError("fifo_lowering must be auto, static, or dynamic")
         # virtual mapping can only be applied to DAG
         if not self.computation_is_dag:
             if mapping_primitives is not None and len(mapping_primitives) > 0:
@@ -1009,6 +1281,8 @@ class AIE_MLIRModule:
             self.core_func_args,
             self.streams,
             self.virtual_computation_graph,
+            output_fifo_depth=output_fifo_depth,
+            fifo_lowering=fifo_lowering,
         )
         (
             self.aie_module,

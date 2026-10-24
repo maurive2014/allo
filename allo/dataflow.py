@@ -616,7 +616,17 @@ def build(
     trace: list[tuple[str, tuple[int, ...]]] = None,
     trace_size: int = 4096,
     device_type: Union[str, None] = None,
+    output_fifo_depth: int = 2,
+    fifo_lowering: str = "auto",
 ):
+    if type(output_fifo_depth) is not int or output_fifo_depth not in (1, 2):
+        raise ValueError("output_fifo_depth must be 1 or 2")
+    if fifo_lowering not in ("auto", "static", "dynamic"):
+        raise ValueError("fifo_lowering must be auto, static, or dynamic")
+    if target != "aie" and fifo_lowering != "auto":
+        raise ValueError("fifo_lowering is only supported for AIE")
+    if target != "aie" and output_fifo_depth != 2:
+        raise ValueError("output_fifo_depth is only supported for AIE")
     project = os.path.abspath(os.path.expanduser(project))
     assert not profile or target == "aie", "Profiling is only supported for AIE target"
     assert (
@@ -661,6 +671,8 @@ def build(
             num_iters=num_iters,
             trace=trace,
             trace_size=trace_size,
+            output_fifo_depth=output_fifo_depth,
+            fifo_lowering=fifo_lowering,
         )
         return aie_mod
 

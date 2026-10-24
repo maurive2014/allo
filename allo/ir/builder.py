@@ -2050,11 +2050,17 @@ class ASTTransformer(ASTBuilder):
             ):
                 memory_space = arg.dtensor.memory.get_memory_space()
             if isinstance(arg.dtype, Stream):
-                input_types.append(allo_d.StreamType.get(arg.dtype.build(), depth=arg.dtype.depth))
+                input_types.append(
+                    allo_d.StreamType.get(arg.dtype.build(), depth=arg.dtype.depth)
+                )
             else:
                 input_types.append(
                     ASTTransformer.build_shaped_type(
-                        ctx, arg.dtype, arg.shape, layout=layout, memory_space=memory_space
+                        ctx,
+                        arg.dtype,
+                        arg.shape,
+                        layout=layout,
+                        memory_space=memory_space,
                     )
                 )
             input_typehints.append(get_extra_type_hints(arg.dtype))
@@ -2077,7 +2083,9 @@ class ASTTransformer(ASTBuilder):
             else:
                 # Single return
                 if isinstance(arg.dtype, Stream):
-                    output_types.append(allo_d.StreamType.get(arg.dtype.build(), depth=arg.dtype.depth))
+                    output_types.append(
+                        allo_d.StreamType.get(arg.dtype.build(), depth=arg.dtype.depth)
+                    )
                 else:
                     output_types.append(
                         ASTTransformer.build_shaped_type(
@@ -2441,7 +2449,9 @@ class ASTTransformer(ASTBuilder):
                             stream.attributes["symbolic_slice"] = StringAttr.get(
                                 symbolic_slice
                             )
-                            stream.attributes["iterators"] = DictAttr.get(iterator_infos)
+                            stream.attributes["iterators"] = DictAttr.get(
+                                iterator_infos
+                            )
                         stream = stream.result
                     put_op = allo_d.StreamPutOp(
                         stream,
@@ -2461,14 +2471,14 @@ class ASTTransformer(ASTBuilder):
                     if isinstance(stream, MockArg):
                         stream = stream.val
                     else:
-                        stream = stream.clone(
-                            ip=ctx.get_stream_construct_ip()
-                        )
+                        stream = stream.clone(ip=ctx.get_stream_construct_ip())
                         if symbolic_slice is not None:
                             stream.attributes["symbolic_slice"] = StringAttr.get(
                                 symbolic_slice
                             )
-                            stream.attributes["iterators"] = DictAttr.get(iterator_infos)
+                            stream.attributes["iterators"] = DictAttr.get(
+                                iterator_infos
+                            )
                         stream = stream.result
                     get_op = allo_d.StreamGetOp(
                         node.func.value.dtype.build(),
@@ -3293,6 +3303,34 @@ class ASTTransformer(ASTBuilder):
                         permutation=tuple(x.val for x in new_args[1]),
                     )
             elif attr == "view":
+                source = ASTTransformer.get_mlir_op_result(ctx, new_args[0])
+                if not ctx.enable_tensor and MemRefType(
+                    source.type
+                ).layout.value == AffineMap.get_identity(len(source.type.shape)):
+                    # A static view of contiguous storage needs no shape tensor.
+                    # In particular, AIE cores cannot reference a host global
+                    # containing the shape of an otherwise local accumulator.
+                    strides = []
+                    stride = 1
+                    for size in reversed(shape):
+                        strides.insert(0, stride)
+                        stride *= size
+                    shaped_type = MemRefType.get(
+                        shape,
+                        source.type.element_type,
+                        memory_space=source.type.memory_space,
+                    )
+                    return memref_d.ReinterpretCastOp(
+                        shaped_type,
+                        source,
+                        [],
+                        [],
+                        [],
+                        [0],
+                        list(shape),
+                        strides,
+                        ip=ctx.get_ip(),
+                    )
                 view_op = (
                     tensor_d.ReshapeOp if ctx.enable_tensor else memref_d.ReshapeOp
                 )
