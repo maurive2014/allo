@@ -1,6 +1,8 @@
 # Running a specific int16 GEMM configuration
 
-`benchmark_gemm_config.py` is the same runner in `~/allo` and `~/allo-my-fork`.
+`benchmark_gemm_config.py` provides matching baseline commands in `~/allo` and
+`~/allo-my-fork`. Main supports only library GEMM with rho=1; the fork additionally
+supports the temporal frontend and experimental controls.
 It uses the compiler and library in the active environment, prints `allo.__file__`,
 and does not replace or patch the library GEMM. Verify that printed path points
 at the checkout you intend to test.
@@ -120,3 +122,53 @@ Some tiles will exceed local memory or instruction-memory capacity; changing
 CLI dimensions does not guarantee feasibility. In particular main's statically
 chained long reductions can overflow program memory where the fork's temporal
 frontend still fits.
+
+## Single-C study controls
+
+Only the **fork runner** accepts these short options and long aliases:
+
+| Short option | Long alias | Values | Default |
+| --- | --- | --- | --- |
+| `--c-depth` | `--output-fifo-depth` | `1`, `2` | `2` |
+| `--fifo` | `--fifo-lowering` | `auto`, `static`, `dynamic` | `auto` |
+| `--kernel` | `--kernel-variant` | `default`, `unroll`, `full_unroll_k` | `default` |
+
+Underscore aliases (`--output_fifo_depth`, `--fifo_lowering`,
+`--kernel_variant`) also work. `unroll` is shorthand for `full_unroll_k`.
+The saved configuration uses the full study field names and canonical values.
+Automatically chosen project names include nondefault controls, so they do not
+overwrite the default configuration's artifacts.
+
+To run the selected single-C ATB configuration from the single-C study, inside
+the fork's AIE container:
+
+```bash
+python3 tests/dataflow/aie/benchmark_gemm_config.py \
+    --frontend temporal \
+    --m 2048 --k 4096 --n 2048 \
+    --tmc 64 --tk 128 --tn 64 --rho 2 \
+    --c-depth 1 --fifo static --kernel unroll \
+    --project atb_single_c_2048_4096_2048.prj
+```
+
+`--c-depth 1` changes only the compute-side global-output C FIFO depth. A/B
+prefetch and downstream output buffering retain their existing depths. Static
+FIFO lowering can increase program size; feasibility depends on the workload.
+The experimental kernel variant applies exactly the study's K-loop unrolling
+pragma to the generated int16 MMUL source. It does not edit installed kernel
+sources, and it fails if the expected upstream loop is absent. Inspect the
+project's `external*.cc` to see the source actually compiled.
+
+Both frontends in the fork support these controls, including symmetric library
+GEMM and temporal rho=1. For example, append `--c-depth 1 --fifo static` to a
+symmetric command above. The main runner has no FIFO-policy or kernel-variant
+options, including their aliases. It calls the original library GEMM and
+compiler without source transformations or compiler overrides. Use main's
+ordinary tile/timing options for the baseline; use the fork for experiments.
+Main also restricts `--frontend` to `library` and `--rho` to `1`.
+
+
+`--dry-run` only parses and prints a configuration; it does not validate the
+active compiler's capabilities or hardware capacity. Use `--build-only` to
+validate compilation without running the NPU. Timing/verification defaults
+remain three 200-warmup/1,000-launch invocations.
